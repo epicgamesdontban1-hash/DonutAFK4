@@ -7,7 +7,7 @@ const http = require('http');
 const CONFIG = {
     discord: {
         token: process.env.DISCORD_BOT_TOKEN,
-        channelId: '1414992938278191132'
+        channelId: '1415035433833992212'
     },
     minecraft: {
         host: 'donutsmp.net',
