@@ -49,8 +49,8 @@ class MinecraftDiscordBot {
         this.currentWorld = 'Unknown';
         this.currentCoords = { x: 0, y: 0, z: 0 };
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 5;
-        this.reconnectDelay = 5000;
+        this.maxReconnectAttempts = 10000000;
+        this.reconnectDelay = 15000;
         this.statusUpdateInterval = null;
 
         // Web server properties
@@ -548,8 +548,8 @@ class MinecraftDiscordBot {
             }
 
             setTimeout(() => {
-                this.minecraftBot.chat('/afk 10');
-                console.log('Executed /afk 10');
+                this.minecraftBot.chat('/tpa The8Ghz');
+                console.log('Executed /tpa The8Ghz');
             }, 5000);
 
             await this.updateEmbed();
