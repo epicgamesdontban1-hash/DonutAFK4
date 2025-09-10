@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
 const mineflayer = require('mineflayer');
 const express = require('express');
 const http = require('http');
@@ -7,7 +7,7 @@ const http = require('http');
 const CONFIG = {
     discord: {
         token: process.env.DISCORD_BOT_TOKEN,
-        channelId: '1415035433833992212'
+        channelId: process.env.DISCORD_CHANNEL_ID
     },
     minecraft: {
         host: 'donutsmp.net',
@@ -16,7 +16,7 @@ const CONFIG = {
         auth: 'microsoft'
     },
     webServer: {
-        port: process.env.PORT || 3000,
+        port: process.env.PORT || 5000,
         host: '0.0.0.0'
     }
 };
@@ -33,6 +33,7 @@ class MinecraftDiscordBot {
         this.minecraftBot = null;
         this.controlMessage = null;
         this.isConnected = false;
+        this.isConnecting = false;
         this.authUrl = null;
         this.userCode = null;
         this.shouldJoin = false;
@@ -49,7 +50,7 @@ class MinecraftDiscordBot {
         this.currentWorld = 'Unknown';
         this.currentCoords = { x: 0, y: 0, z: 0 };
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 10000000;
+        this.maxReconnectAttempts = 10000;
         this.reconnectDelay = 15000;
         this.statusUpdateInterval = null;
 
@@ -57,14 +58,19 @@ class MinecraftDiscordBot {
         this.app = null;
         this.server = null;
 
+        // Scoreboard properties
+        this.lastScoreboard = null;
+        this.scoreboardUpdateInterval = null;
+
         this.setupDiscordEvents();
+        this.setupSlashCommands();
     }
 
     async start() {
         try {
             // Start Discord bot first
             await this.discordClient.login(CONFIG.discord.token);
-            console.log('Discord bot logged in successfully!');
+            console.log('✅ Discord bot connected successfully!');
 
             // Start periodic status updates every 30 seconds
             this.statusUpdateInterval = setInterval(() => {
@@ -84,7 +90,7 @@ class MinecraftDiscordBot {
 
     async startWebServer() {
         this.app = express();
-
+        
         // Middleware
         this.app.use(express.json());
         this.app.use(express.static('public')); // Serve static files if you have any
@@ -162,19 +168,19 @@ class MinecraftDiscordBot {
             this.shouldJoin = true;
             this.reconnectAttempts = 0;
             await this.connectToMinecraft();
-
+            
             res.json({ success: true, message: 'Connection initiated' });
         });
 
         this.app.post('/disconnect', async (req, res) => {
             this.shouldJoin = false;
             this.reconnectAttempts = 0;
-
+            
             if (this.minecraftBot) {
                 this.minecraftBot.quit();
                 this.minecraftBot = null;
             }
-
+            
             await this.updateEmbed();
             res.json({ success: true, message: 'Bot disconnected' });
         });
@@ -182,11 +188,11 @@ class MinecraftDiscordBot {
         // Send chat message endpoint
         this.app.post('/chat', (req, res) => {
             const { message } = req.body;
-
+            
             if (!this.isConnected || !this.minecraftBot) {
                 return res.json({ success: false, message: 'Bot not connected' });
             }
-
+            
             if (!message || typeof message !== 'string') {
                 return res.json({ success: false, message: 'Invalid message' });
             }
@@ -239,6 +245,7 @@ class MinecraftDiscordBot {
     setupDiscordEvents() {
         this.discordClient.once('ready', async () => {
             console.log(`Logged in as ${this.discordClient.user.tag}`);
+            await this.registerSlashCommands();
             await this.setupControlMessage();
         });
 
@@ -262,11 +269,11 @@ class MinecraftDiscordBot {
                     .setTimestamp();
 
                 this.authMessage = await reaction.message.channel.send({ embeds: [authEmbed] });
-                console.log('[DEBUG] Sent auth message to channel');
+                console.log('🔐 Authentication message sent to Discord channel');
 
                 setTimeout(() => {
                     if (this.authMessage && !this.isConnected) {
-                        console.log('[DEBUG] Force checking for auth code...');
+                        console.log('🔍 Checking for authentication completion...');
                         this.forceCheckAuthCode();
                     }
                 }, 3000);
@@ -284,6 +291,33 @@ class MinecraftDiscordBot {
             }
 
             await reaction.users.remove(user.id);
+        });
+
+        // Handle slash commands
+        this.discordClient.on('interactionCreate', async (interaction) => {
+            if (!interaction.isChatInputCommand()) return;
+
+            // Check if command is used in the correct channel
+            if (interaction.channelId !== CONFIG.discord.channelId) {
+                await interaction.reply({ 
+                    content: '❌ This bot can only be used in the designated channel!', 
+                    ephemeral: true 
+                });
+                return;
+            }
+
+            try {
+                await this.handleSlashCommand(interaction);
+            } catch (error) {
+                console.error('Error handling slash command:', error);
+                const errorMessage = 'There was an error while executing this command!';
+                
+                if (interaction.replied || interaction.deferred) {
+                    await interaction.followUp({ content: errorMessage, ephemeral: true });
+                } else {
+                    await interaction.reply({ content: errorMessage, ephemeral: true });
+                }
+            }
         });
     }
 
@@ -360,7 +394,7 @@ class MinecraftDiscordBot {
     }
 
     updatePositionInfo() {
-        if (this.minecraftBot && this.minecraftBot.entity) {
+        if (this.minecraftBot && this.minecraftBot.entity && this.minecraftBot.entity.position) {
             this.currentCoords = {
                 x: this.minecraftBot.entity.position.x,
                 y: this.minecraftBot.entity.position.y,
@@ -372,6 +406,11 @@ class MinecraftDiscordBot {
     async attemptReconnect() {
         if (!this.shouldJoin) {
             console.log('[RECONNECT] Reconnection cancelled - shouldJoin is false');
+            return;
+        }
+
+        if (this.isConnecting) {
+            console.log('[RECONNECT] Connection already in progress, skipping');
             return;
         }
 
@@ -387,20 +426,30 @@ class MinecraftDiscordBot {
 
         await this.updateEmbed();
 
+        // Add longer delay between reconnect attempts to avoid "already online" issues
+        const delay = this.reconnectDelay * this.reconnectAttempts; // Exponential backoff
+        console.log(`[RECONNECT] Waiting ${delay}ms before next attempt`);
+
         setTimeout(async () => {
-            if (this.shouldJoin && !this.isConnected) {
+            if (this.shouldJoin && !this.isConnected && !this.isConnecting) {
                 await this.connectToMinecraft();
             }
-        }, this.reconnectDelay);
+        }, delay);
     }
 
     async connectToMinecraft() {
+        if (this.isConnecting) {
+            console.log('🎮 Connection already in progress, skipping...');
+            return;
+        }
+
         if (this.minecraftBot) {
             this.minecraftBot.quit();
         }
 
         try {
-            console.log('Attempting to connect to Minecraft server...');
+            this.isConnecting = true;
+            console.log('🎮 Connecting to Minecraft server...');
             await this.updateEmbed();
 
             this.setupConsoleCapture();
@@ -437,6 +486,7 @@ class MinecraftDiscordBot {
 
         } catch (error) {
             console.error('Failed to connect to Minecraft:', error);
+            this.isConnecting = false;
             if (this.shouldJoin) {
                 console.log('[RECONNECT] Connection failed, attempting reconnect...');
                 await this.attemptReconnect();
@@ -447,31 +497,18 @@ class MinecraftDiscordBot {
     }
 
     setupConsoleCapture() {
-        console.log('[DEBUG] Setting up console capture...');
-
-        if (!this.originalConsoleLog) {
-            this.originalConsoleLog = console.log;
-            console.log = (...args) => {
-                const message = args.join(' ');
-                this.originalConsoleLog('[DEBUG] Console message:', message);
-
-                if (message.includes('microsoft.com/link') && message.includes('use the code')) {
-                    this.originalConsoleLog('[DEBUG] FOUND AUTH IN CONSOLE.LOG!');
-                    this.extractAuthDetails(message);
-                }
-
-                this.originalConsoleLog.apply(console, args);
-            };
-        }
-
+        // Simplified console capture for auth detection only
         if (!this.originalStderrWrite) {
             this.originalStderrWrite = process.stderr.write;
             process.stderr.write = (chunk, encoding, callback) => {
                 const message = chunk.toString();
 
+                // Only capture auth messages, suppress debug spam
                 if (message.includes('microsoft.com/link') && message.includes('use the code')) {
-                    console.log('[DEBUG] FOUND AUTH IN STDERR!');
                     this.extractAuthDetails(message);
+                } else if (message.includes('Chunk size') || message.includes('partial packet')) {
+                    // Suppress these debug messages completely
+                    return true;
                 }
 
                 return this.originalStderrWrite.call(process.stderr, chunk, encoding, callback);
@@ -483,37 +520,34 @@ class MinecraftDiscordBot {
             process.stdout.write = (chunk, encoding, callback) => {
                 const message = chunk.toString();
 
+                // Only capture auth messages, suppress debug spam
                 if (message.includes('microsoft.com/link') && message.includes('use the code')) {
-                    console.log('[DEBUG] FOUND AUTH IN STDOUT!');
                     this.extractAuthDetails(message);
+                } else if (message.includes('Chunk size') || message.includes('partial packet')) {
+                    // Suppress these debug messages completely
+                    return true;
                 }
 
                 return this.originalStdoutWrite.call(process.stdout, chunk, encoding, callback);
             };
         }
-
-        this.authCheckInterval = setInterval(() => {
-            if (this.lastAuthUser && this.authMessage && !this.isConnected) {
-                console.log('[DEBUG] Manual check - looking for recent auth code in logs...');
-            }
-        }, 1000);
     }
 
     async forceCheckAuthCode() {
-        console.log('[DEBUG] forceCheckAuthCode called but disabled to prevent edits');
         return;
     }
 
     setupMinecraftEvents() {
         this.minecraftBot.on('login', async () => {
-            console.log('Successfully logged into Minecraft server!');
+            console.log('✅ Successfully connected to Minecraft server!');
             this.isConnected = true;
+            this.isConnecting = false;
             this.authUrl = null;
             this.userCode = null;
             this.authMessageSent = false;
             this.reconnectAttempts = 0;
 
-            if (this.minecraftBot.game && this.minecraftBot.game.dimension) {
+            if (this.minecraftBot && this.minecraftBot.game && this.minecraftBot.game.dimension) {
                 this.currentWorld = this.minecraftBot.game.dimension;
             }
 
@@ -528,10 +562,10 @@ class MinecraftDiscordBot {
             if (this.authMessage) {
                 try {
                     await this.authMessage.delete();
-                    console.log('[DEBUG] Deleted auth message after successful login');
+                    console.log('🗑️  Authentication message cleaned up');
                     this.authMessage = null;
                 } catch (error) {
-                    console.error('[DEBUG] Failed to delete auth message:', error);
+                    console.error('⚠️  Failed to clean up auth message:', error);
                 }
             }
 
@@ -539,17 +573,19 @@ class MinecraftDiscordBot {
         });
 
         this.minecraftBot.on('spawn', async () => {
-            console.log('Bot spawned in game');
+            console.log('🌍 Bot spawned in Minecraft world');
 
             this.updatePositionInfo();
 
-            if (this.minecraftBot.game && this.minecraftBot.game.dimension) {
+            if (this.minecraftBot && this.minecraftBot.game && this.minecraftBot.game.dimension) {
                 this.currentWorld = this.minecraftBot.game.dimension;
             }
 
             setTimeout(() => {
-                this.minecraftBot.chat('/tpa The8Ghz');
-                console.log('Executed /tpa The8Ghz');
+                if (this.minecraftBot) {
+                    this.minecraftBot.chat('/tpa doggomc');
+                    console.log('📞 Sent teleport request to doggomc');
+                }
             }, 5000);
 
             await this.updateEmbed();
@@ -560,7 +596,7 @@ class MinecraftDiscordBot {
         });
 
         this.minecraftBot.on('respawn', () => {
-            if (this.minecraftBot.game && this.minecraftBot.game.dimension) {
+            if (this.minecraftBot && this.minecraftBot.game && this.minecraftBot.game.dimension) {
                 this.currentWorld = this.minecraftBot.game.dimension;
                 console.log('Bot respawned/changed dimension to:', this.currentWorld);
                 this.updateEmbed();
@@ -568,8 +604,9 @@ class MinecraftDiscordBot {
         });
 
         this.minecraftBot.on('end', async (reason) => {
-            console.log('Minecraft connection ended:', reason);
+            console.log('🔌 Minecraft connection ended:', reason);
             this.isConnected = false;
+            this.isConnecting = false;
             this.minecraftBot = null;
             this.currentWorld = 'Unknown';
             this.currentCoords = { x: 0, y: 0, z: 0 };
@@ -583,8 +620,9 @@ class MinecraftDiscordBot {
         });
 
         this.minecraftBot.on('error', async (error) => {
-            console.error('Minecraft bot error:', error);
+            console.error('❌ Minecraft bot error:', error);
             this.isConnected = false;
+            this.isConnecting = false;
             this.currentWorld = 'Unknown';
             this.currentCoords = { x: 0, y: 0, z: 0 };
 
@@ -597,8 +635,9 @@ class MinecraftDiscordBot {
         });
 
         this.minecraftBot.on('kicked', async (reason) => {
-            console.log('Bot was kicked:', reason);
+            console.log('⚠️  Bot was kicked from server:', reason);
             this.isConnected = false;
+            this.isConnecting = false;
             this.minecraftBot = null;
             this.currentWorld = 'Unknown';
             this.currentCoords = { x: 0, y: 0, z: 0 };
@@ -668,6 +707,290 @@ class MinecraftDiscordBot {
             await this.controlMessage.edit({ embeds: [embed] });
         } catch (error) {
             console.error('Failed to update embed:', error);
+        }
+    }
+
+    // Setup slash commands
+    setupSlashCommands() {
+        this.commands = [
+            new SlashCommandBuilder()
+                .setName('message')
+                .setDescription('Send a message to the Minecraft server')
+                .addStringOption(option =>
+                    option.setName('text')
+                        .setDescription('The message to send')
+                        .setRequired(true)
+                ),
+            new SlashCommandBuilder()
+                .setName('shards')
+                .setDescription('Check available shards on the Minecraft account'),
+            new SlashCommandBuilder()
+                .setName('status')
+                .setDescription('Show bot connection status'),
+            new SlashCommandBuilder()
+                .setName('connect')
+                .setDescription('Connect the bot to the Minecraft server'),
+            new SlashCommandBuilder()
+                .setName('disconnect')
+                .setDescription('Disconnect the bot from the Minecraft server')
+        ];
+    }
+
+    // Register slash commands with Discord
+    async registerSlashCommands() {
+        try {
+            const rest = new REST({ version: '10' }).setToken(CONFIG.discord.token);
+
+            console.log('🔄 Registering Discord slash commands...');
+
+            await rest.put(
+                Routes.applicationCommands(this.discordClient.user.id),
+                { body: this.commands.map(command => command.toJSON()) }
+            );
+
+            console.log('✅ Discord slash commands registered successfully!');
+        } catch (error) {
+            console.error('Error registering slash commands:', error);
+        }
+    }
+
+    // Handle slash command interactions
+    async handleSlashCommand(interaction) {
+        const { commandName } = interaction;
+
+        switch (commandName) {
+            case 'message':
+                await this.handleMessageCommand(interaction);
+                break;
+            case 'shards':
+                await this.handleShardsCommand(interaction);
+                break;
+            case 'status':
+                await this.handleStatusCommand(interaction);
+                break;
+            case 'connect':
+                await this.handleConnectCommand(interaction);
+                break;
+            case 'disconnect':
+                await this.handleDisconnectCommand(interaction);
+                break;
+            default:
+                await interaction.reply({ content: 'Unknown command!', ephemeral: true });
+        }
+    }
+
+    // Handle /message command
+    async handleMessageCommand(interaction) {
+        const message = interaction.options.getString('text');
+
+        if (!this.isConnected || !this.minecraftBot) {
+            await interaction.reply({ 
+                content: '❌ Bot is not connected to the Minecraft server!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        try {
+            this.minecraftBot.chat(message);
+            await interaction.reply({ 
+                content: `✅ Message sent: "${message}"`, 
+                ephemeral: true 
+            });
+            console.log(`Message sent to Minecraft: ${message}`);
+        } catch (error) {
+            console.error('Error sending message to Minecraft:', error);
+            await interaction.reply({ 
+                content: '❌ Failed to send message to Minecraft server!', 
+                ephemeral: true 
+            });
+        }
+    }
+
+    // Handle /shards command
+    async handleShardsCommand(interaction) {
+        if (!this.isConnected || !this.minecraftBot) {
+            await interaction.reply({ 
+                content: '❌ Bot is not connected to the Minecraft server!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        try {
+            // Set up message listener for shards response
+            const messageListener = (message) => {
+                const messageText = message.toString();
+                
+                // Look for shards information in the message
+                if (messageText.includes('shard') || messageText.includes('Shard')) {
+                    this.handleShardsResponse(interaction, messageText);
+                    this.minecraftBot.removeListener('message', messageListener);
+                }
+            };
+
+            // Add temporary message listener
+            this.minecraftBot.on('message', messageListener);
+
+            // Send the /shards command
+            this.minecraftBot.chat('/shards');
+            console.log('💎 Requested shards information from server');
+
+            // Remove listener after 10 seconds if no response
+            setTimeout(() => {
+                this.minecraftBot.removeListener('message', messageListener);
+                if (!interaction.replied) {
+                    interaction.editReply({
+                        content: '⏰ No response from server. The /shards command may not be available or took too long to respond.'
+                    });
+                }
+            }, 10000);
+
+        } catch (error) {
+            console.error('💎 Error requesting shards:', error);
+            await interaction.editReply({ 
+                content: '❌ Failed to request shards information!' 
+            });
+        }
+    }
+
+    // Handle /status command
+    async handleStatusCommand(interaction) {
+        const embed = new EmbedBuilder()
+            .setTitle('🤖 Bot Status')
+            .setColor(this.isConnected ? '#00ff00' : '#ff0000')
+            .addFields(
+                { name: '🎮 Minecraft', value: this.isConnected ? '✅ Connected' : '❌ Disconnected', inline: true },
+                { name: '💬 Discord', value: '✅ Connected', inline: true },
+                { name: '🌐 Web Server', value: `✅ Running on port ${CONFIG.webServer.port}`, inline: true }
+            );
+
+        if (this.isConnected && this.minecraftBot) {
+            embed.addFields(
+                { name: '👤 Username', value: this.minecraftBot.username || 'Unknown', inline: true },
+                { name: '🌍 World', value: this.currentWorld, inline: true },
+                { name: '📍 Position', value: `X: ${Math.round(this.currentCoords.x)}, Y: ${Math.round(this.currentCoords.y)}, Z: ${Math.round(this.currentCoords.z)}`, inline: true }
+            );
+        }
+
+        embed.setTimestamp();
+        await interaction.reply({ embeds: [embed] });
+    }
+
+    // Handle /connect command
+    async handleConnectCommand(interaction) {
+        if (this.isConnected) {
+            await interaction.reply({ 
+                content: '✅ Bot is already connected to the Minecraft server!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        this.shouldJoin = true;
+        this.reconnectAttempts = 0;
+        await this.connectToMinecraft();
+        
+        await interaction.reply({ 
+            content: '🔄 Attempting to connect to the Minecraft server...', 
+            ephemeral: true 
+        });
+    }
+
+    // Handle /disconnect command
+    async handleDisconnectCommand(interaction) {
+        if (!this.isConnected) {
+            await interaction.reply({ 
+                content: '❌ Bot is not connected to the Minecraft server!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        this.shouldJoin = false;
+        this.reconnectAttempts = 0;
+        
+        if (this.minecraftBot) {
+            this.minecraftBot.quit();
+            this.minecraftBot = null;
+        }
+        
+        await this.updateEmbed();
+        await interaction.reply({ 
+            content: '✅ Bot disconnected from the Minecraft server!', 
+            ephemeral: true 
+        });
+    }
+
+    // Handle shards response from Minecraft
+    async handleShardsResponse(interaction, messageText) {
+        try {
+            console.log('💎 Received shards response:', messageText);
+            
+            // Parse the message to extract shard information
+            let shardsInfo = 'Unknown';
+            
+            // Look for various patterns that might indicate shard count
+            const patterns = [
+                /shards?[:\s]+([0-9,]+)/i,
+                /([0-9,]+)\s+shards?/i,
+                /balance[:\s]+([0-9,]+)/i,
+                /you\s+have[:\s]+([0-9,]+)/i
+            ];
+            
+            for (const pattern of patterns) {
+                const match = messageText.match(pattern);
+                if (match) {
+                    shardsInfo = match[1];
+                    break;
+                }
+            }
+            
+            // Create embed with shard information
+            const embed = new EmbedBuilder()
+                .setTitle('💎 Shard Balance')
+                .setColor('#9d4edd')
+                .setTimestamp();
+            
+            if (shardsInfo !== 'Unknown') {
+                embed.addFields({
+                    name: '💰 Available Shards',
+                    value: shardsInfo,
+                    inline: true
+                });
+                embed.setDescription('Current shard balance on your account');
+            } else {
+                embed.setDescription('Shard information received but could not parse the amount.');
+                embed.addFields({
+                    name: '📋 Raw Response',
+                    value: messageText.substring(0, 1000), // Limit length
+                    inline: false
+                });
+            }
+            
+            if (!interaction.replied) {
+                const reply = await interaction.editReply({ embeds: [embed] });
+                
+                // Delete the message after 10 seconds
+                setTimeout(async () => {
+                    try {
+                        await reply.delete();
+                        console.log('💎 Shards message auto-deleted after 10 seconds');
+                    } catch (error) {
+                        console.error('⚠️ Failed to delete shards message:', error.message);
+                    }
+                }, 10000);
+            }
+            
+        } catch (error) {
+            console.error('💎 Error processing shards response:', error);
+            if (!interaction.replied) {
+                await interaction.editReply({
+                    content: '❌ Error processing shards response!'
+                });
+            }
         }
     }
 
